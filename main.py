@@ -1,9 +1,11 @@
 import os
+import json
 from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import and_, select
 from sqlalchemy.exc import IntegrityError
@@ -12,46 +14,58 @@ from sqlalchemy.orm import Session
 from database.db import get_db
 from database.models import Conversation, Message
 
-load_dotenv()
+load_dotenv(override=True)
 
 RODIUMAI_URL = "https://api.rodiumai.io/v1/chat/completions"
-RODIUMAI_API_KEY = os.environ["RODIUMAI_API_KEY"]
-MODEL = os.getenv("RODIUMAI_MODEL", "anthropic/claude-sonnet-4-5-20250929")
+RODIUMAI_API_KEY = os.environ.get("RODIUMAI_API_KEY", "")
+MODEL = os.getenv("RODIUMAI_MODEL", "openai/gpt-4o")
 PREVIEW_LENGTH = 60
 
-# Roles the LLM understands. Anything else stored in the DB (e.g. notifications) stays out of its prompt.
 LLM_ROLES = {"user", "assistant"}
 NOTIFICATION_ROLE = "system-notification"
-NOTIFICATION_EVERY = 10  # a notification each time the dialogue reaches a multiple of this many messages
+NOTIFICATION_EVERY = 10
 NOTIFICATION_TEXT = "Notification système : Une dizaine de messages écrits."
 
-SYSTEM_PROMPT = (
-    "Tu es Study Buddy, un tuteur bienveillant pour les étudiants."
-    "Réponds aux questions de manière claire et concise."
-)
+prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "system.md")
+try:
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        SYSTEM_PROMPT = f.read()
+except FileNotFoundError:
+    SYSTEM_PROMPT = (
+        "Tu es Study Buddy, un tuteur bienveillant pour les étudiants. "
+        "Réponds aux questions de manière claire et concise."
+    )
 
 app = FastAPI(title="Study Buddy Chatbot")
 
+# Liste stricte des modèles autorisés
+ALLOWED_MODELS = [
+    {"id": "anthropic/claude-sonnet-4-5-20250929", "name": "Claude 3.5 Sonnet"},
+    {"id": "openai/gpt-4o", "name": "GPT-4o"}
+]
+
+@app.get("/models")
+def get_models():
+    """Retourne la liste des modèles disponibles au frontend."""
+    return {"models": ALLOWED_MODELS}
 
 class ConversationResponse(BaseModel):
     conversation_id: int
 
-
 class ConversationSummary(BaseModel):
     id: int
     created_at: datetime
-    preview: str | None  # first user message, truncated; None while the conversation is empty
-
+    preview: str | None
 
 class ChatRequest(BaseModel):
     conversation_id: int
     message: str
-
+    role: str = "user"
+    model: str = "openai/gpt-4o"
 
 class ChatResponse(BaseModel):
     reply: str
-    notification: str | None = None  # set when this turn also stored a system-notification
-
+    notification: str | None = None
 
 class MessageResponse(BaseModel):
     seq: int
@@ -59,9 +73,7 @@ class MessageResponse(BaseModel):
     content: str
     created_at: datetime
 
-
 def load_messages(db: Session, conversation_id: int) -> list[Message]:
-    # A conversation's messages in order; 404 if the conversation doesn't exist.
     if db.get(Conversation, conversation_id) is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
     return db.scalars(
@@ -70,12 +82,8 @@ def load_messages(db: Session, conversation_id: int) -> list[Message]:
         .order_by(Message.seq)
     ).all()
 
-
 def build_llm_history(rows: list[Message]) -> list[dict]:
-    # The DB history is not necessarily what the LLM sees: filter it here, just before building the request.
-    # For now we only drop the roles the LLM doesn't know (system-notification).
     return [{"role": m.role, "content": m.content} for m in rows if m.role in LLM_ROLES]
-
 
 @app.post("/conversations", status_code=201)
 def create_conversation(db: Session = Depends(get_db)) -> ConversationResponse:
@@ -84,85 +92,107 @@ def create_conversation(db: Session = Depends(get_db)) -> ConversationResponse:
     db.commit()
     return ConversationResponse(conversation_id=conversation.id)
 
-
 @app.get("/conversations")
 def list_conversations(db: Session = Depends(get_db)) -> list[ConversationSummary]:
-    # Newest first, each joined to its first message (seq 1, always the user's) for the preview.
     rows = db.execute(
         select(Conversation, Message.content)
         .outerjoin(Message, and_(Message.conversation_id == Conversation.id, Message.seq == 1))
         .order_by(Conversation.id.desc())
     ).all()
-    return [
-        ConversationSummary(
-            id=conversation.id,
-            created_at=conversation.created_at,
-            preview=content[:PREVIEW_LENGTH] if content else None,
-        )
-        for conversation, content in rows
-    ]
-
+    
+    results = []
+    for r in rows:
+        preview = r.content[:PREVIEW_LENGTH] + "..." if r.content and len(r.content) > PREVIEW_LENGTH else r.content
+        results.append(ConversationSummary(id=r.Conversation.id, created_at=r.Conversation.created_at, preview=preview))
+    return results
 
 @app.get("/conversations/{conversation_id}/messages")
-def list_messages(conversation_id: int, db: Session = Depends(get_db)) -> list[MessageResponse]:
+def get_messages(conversation_id: int, db: Session = Depends(get_db)) -> list[MessageResponse]:
+    rows = load_messages(db, conversation_id)
     return [
         MessageResponse(seq=m.seq, role=m.role, content=m.content, created_at=m.created_at)
-        for m in load_messages(db, conversation_id)
+        for m in rows
     ]
 
-
 @app.post("/chat")
-def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
-    # Load this conversation from the database, in message order.
-    rows = load_messages(db, req.conversation_id)
-    history = build_llm_history(rows)
-    # seq follows every stored row (notifications included) so it stays unique.
-    next_seq = rows[-1].seq + 1 if rows else 1
-    user_message = {"role": "user", "content": req.message}
+async def chat_endpoint(req: ChatRequest, db: Session = Depends(get_db)):
+    # 1. Vérification du modèle
+    allowed_model_ids = [m["id"] for m in ALLOWED_MODELS]
+    if req.model not in allowed_model_ids:
+        raise HTTPException(status_code=400, detail="Modèle non autorisé.")
 
-    # The LLM is stateless: resend the system prompt + the whole conversation each turn.
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, user_message]
+    messages_in_db = load_messages(db, req.conversation_id)
+    next_seq = len(messages_in_db) + 1
 
-    try:
-        response = httpx.post(
-            RODIUMAI_URL,
-            headers={"Authorization": f"Bearer {RODIUMAI_API_KEY}"},
-            json={
-                "model": MODEL,
-                "messages": messages, 
-                "max_tokens": 512,
-                "stream": False,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="The LLM API call failed.") from exc
+    # 2. Sauvegarde du message utilisateur (ou de la note)
+    user_msg = Message(
+        conversation_id=req.conversation_id,
+        seq=next_seq,
+        role=req.role,
+        content=req.message
+    )
+    db.add(user_msg)
+    db.commit()
 
-    reply = response.json()["choices"][0]["message"]["content"]
+    # Gestion du rôle 'note'
+    if req.role == "note":
+        async def note_stream():
+            yield f"data: {json.dumps({'chunk': '📝 Note personnelle sauvegardée.'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(note_stream(), media_type="text/event-stream")
 
-    # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
-    db.add_all([
-        Message(conversation_id=req.conversation_id, seq=next_seq, role="user", content=req.message),
-        Message(conversation_id=req.conversation_id, seq=next_seq + 1, role="assistant", content=reply),
-    ])
+    # 3. Préparation pour le LLM
+    messages_in_db.append(user_msg)
+    llm_history = build_llm_history(messages_in_db)
+    
+    payload = {
+        "model": req.model,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + llm_history,
+        "stream": True
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {RODIUMAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-    # Count only the dialogue (user + assistant): counting notifications too would shift the total
-    # off the multiples of 10 for good after the first one.
-    notification = None
-    if (len(history) + 2) % NOTIFICATION_EVERY == 0:
-        notification = NOTIFICATION_TEXT
-        db.add(Message(
-            conversation_id=req.conversation_id, seq=next_seq + 2, role=NOTIFICATION_ROLE, content=notification
-        ))
+    # 4. Générateur pour le flux SSE
+    async def generate():
+        full_content = ""
+        async with httpx.AsyncClient() as client:
+            try:
+                async with client.stream("POST", RODIUMAI_URL, headers=headers, json=payload, timeout=60.0) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                # SÉCURITÉ : On vérifie que la liste "choices" n'est pas vide
+                                if data.get("choices") and len(data["choices"]) > 0:
+                                    chunk = data["choices"][0]["delta"].get("content", "")
+                                    if chunk:
+                                        full_content += chunk
+                                        yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+                            except json.JSONDecodeError:
+                                continue
+            except httpx.HTTPError as exc:
+                print(f"Erreur LLM : {exc}")
+                yield f"data: {json.dumps({'error': 'Erreur API LLM'})}\n\n"
 
-    try:
-        db.commit()
-    except IntegrityError:
-        # Another request already wrote these seq numbers in this conversation while we waited for the LLM.
-        db.rollback()
-        raise HTTPException(
-            status_code=409, detail="The conversation was updated concurrently, please retry."
-        )
-    print(history)
-    return ChatResponse(reply=reply, notification=notification)
+        # 5. Sauvegarde de la réponse complète en base
+        if full_content:
+            bot_msg = Message(
+                conversation_id=req.conversation_id,
+                seq=next_seq + 1,
+                role="assistant",
+                content=full_content
+            )
+            db.add(bot_msg)
+            db.commit()
+            
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
